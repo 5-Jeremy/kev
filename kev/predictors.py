@@ -123,6 +123,45 @@ class LocalPredictor:
         self.device = device
         self.context = context
 
+    @classmethod
+    @contextlib.contextmanager
+    def from_model(cls, model, tokenizer, device, context=CONTEXT, temperature=1.0):
+        """Borrow a training model for evaluation without loading or merging another copy.
+
+        Every FSDP rank must score the same records in the same order. Restore module modes,
+        temperature, torch RNG and CUDA kernel settings even if evaluation fails. No optimizer
+        parameters are replaced. The yielded object implements the usual LocalPredictor API.
+        """
+        if not (math.isfinite(temperature) and temperature > 0):
+            raise ValueError("temperature must be finite and positive")
+        modes = [(m, m.training) for m in model.modules()]
+        previous_temperature = model.head.temperature
+        cuda = str(device).startswith("cuda")
+        flags = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32,
+                 torch.backends.cuda.flash_sdp_enabled(), torch.backends.cuda.mem_efficient_sdp_enabled())
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()] if cuda else []):
+            try:
+                model.eval()
+                model.head.temperature = temperature
+                if cuda:
+                    torch.backends.cuda.matmul.allow_tf32 = False
+                    torch.backends.cudnn.allow_tf32 = False
+                    torch.backends.cuda.enable_flash_sdp(False)
+                    torch.backends.cuda.enable_mem_efficient_sdp(False)
+                predictor = cls.__new__(cls)
+                predictor.checkpoint, predictor.run = None, "in-memory"
+                predictor.model, predictor.tok = model, tokenizer
+                predictor.device, predictor.context, predictor.temperature = device, context, temperature
+                predictor.environment = kernel_environment(model, device)
+                yield predictor
+            finally:
+                model.head.temperature = previous_temperature
+                for module, training in modes: module.training = training
+                if cuda:
+                    torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = flags[:2]
+                    torch.backends.cuda.enable_flash_sdp(flags[2])
+                    torch.backends.cuda.enable_mem_efficient_sdp(flags[3])
+
     @torch.no_grad()
     def __call__(self, record):
         enc = self.model.encode(self.tok, materialize(record), max_state=self.context["max_state"], max_branch=self.context["max_branch"], strict=True)

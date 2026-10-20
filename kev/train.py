@@ -367,7 +367,7 @@ def batch_loss(model, a, batch, dev, anchors, anchor_sources, autocast):
 
 # --- run --------------------------------------------------------------------------------------------------------------
 
-def parse_args():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="Qwen/Qwen3-0.6B-Base")
     ap.add_argument("--n_per_source", type=int, default=1000)
@@ -436,7 +436,7 @@ def parse_args():
     ap.add_argument("--snapshot_every_steps", type=int, default=0, help="full-weight: also write a snapshot every N optimizer steps")
     ap.add_argument("--snapshot_dir", default="", help="where snapshots go (default <out>-snapshots; a study trial's are <trial>/snapshots)")
     ap.add_argument("--seed", type=int, default=0)
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.shared_prefix is None: a.shared_prefix = a.full_ft
     if min(a.epochs, a.accum, a.n_per_source, a.lora, a.batch, a.synthetic_repeat) < 1 or not 0 < a.public_frac <= 1:
         ap.error("epochs, accum, n_per_source, lora, batch and synthetic_repeat must be positive; 0 < public_frac <= 1")
@@ -503,6 +503,21 @@ RESUMED = ("step", "seen", "tokens_seen", "peak_mem", "optimizer_seconds", "step
 MAX_GRAD_NORM = 1.0   # both optimizers clip the global gradient norm to this (full_ft.MasterAdamW's default)
 
 
+def sum_lora_gradients(parameters):
+    """Sum replicated gradients already divided by the global step's record count.
+
+    Keep collective order identical when a parameter is unused on one rank. Globally unused
+    parameters retain grad=None so AdamW does not apply weight decay to them.
+    """
+    params = list(parameters)
+    present = torch.tensor([p.grad is not None for p in params], device=params[0].device, dtype=torch.int32)
+    torch.distributed.all_reduce(present)
+    for p, used in zip(params, present.tolist()):
+        if used:
+            if p.grad is None: p.grad = torch.zeros_like(p)
+            torch.distributed.all_reduce(p.grad)
+
+
 def grad_norm_summary(grad_norms):
     """Per epoch: mean and max of the steps' global gradient norms before clipping, and how many steps were clipped."""
     return [{"epoch": ep, "steps": len(norms), "mean": sum(norms) / len(norms), "max": max(norms), "clipped_steps": sum(n > MAX_GRAD_NORM for n in norms)}
@@ -520,11 +535,17 @@ def pinned_revision(a, manifest):
     return revision
 
 
-def main():
-    a = parse_args()
+def main(args=None, *, on_step=None, distributed_lora=False, scheduler_factory=None):
+    """Optional on_step(model, tokenizer, progress) runs on every rank after an optimizer step.
+
+    distributed_lora opts into replicated LoRA training with summed gradients. The normal CLI and
+    callers without these options retain their training, logging, and checkpoint behavior.
+    scheduler_factory(optimizer, max_lrs, steps) optionally replaces the default OneCycleLR.
+    """
+    a = args if args is not None else parse_args()
     # bf16 weights or autocast hit the accelerator in that dtype (the ROCm crash was the first bf16 kernel).
     dev = select(a.device, dtype=torch.bfloat16 if a.weights_dtype == "bf16" or a.dtype == "bf16" else torch.float32)
-    rank, world = full_ft.init_distributed(dev) if a.full_ft else (0, 1)   # torchrun: each rank's "cuda" is its own GPU
+    rank, world = full_ft.init_distributed(dev) if a.full_ft or distributed_lora else (0, 1)   # torchrun: each rank's "cuda" is its own GPU
     out_dir = Path(a.out)
     if rank: sys.stdout = open(os.devnull, "w", encoding="utf-8")   # one log: rank 0's (errors still reach stderr)
     else: out_dir.mkdir(parents=True, exist_ok=bool(a.resume))
@@ -560,7 +581,10 @@ def main():
         # one runs the packed mask (rows_form) unless a record is over ROW_PASS_TOKENS, whose cost it does not measure
         raise SystemExit("kev.train: --pass_tokens_max needs a hybrid backbone (Gated DeltaNet: every pass runs as rows or a shared "
                          f"prefix, which pass_tokens measures); {a.base} is attention-only and runs the packed mask")
-    if world > 1: full_ft.shard(model)
+    if world > 1:
+        if a.full_ft: full_ft.shard(model)
+        else:
+            for p in model.trainable_parameters(): torch.distributed.broadcast(p.data, 0)
     print(f"device={dev} world={world} trainable params={sum(p.numel() for p in model.trainable_parameters())/1e6:.1f}M", flush=True)
 
     reqs = training_requests(a, tok, manifest, holdout)
@@ -585,7 +609,8 @@ def main():
     steps = min(steps, a.max_steps) if a.max_steps else steps
     if a.full_ft and (problem := full_ft.too_many_snapshots(full_ft.snapshot_fractions(a.snapshot_fractions), a.snapshot_every_steps, steps)):
         raise SystemExit(f"kev.train: {problem}")   # before the first step (and before a resume point is read): nothing to lose yet
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[a.lr, a.head_lr or a.lr], total_steps=max(steps, 1), pct_start=0.1)
+    sched = (torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[a.lr, a.head_lr or a.lr], total_steps=max(steps, 1), pct_start=0.1)
+             if scheduler_factory is None else scheduler_factory(opt, [a.lr, a.head_lr or a.lr], steps))
     step = seen = tokens_seen = peak_mem = optimizer_seconds = elapsed = start_epoch = start_mb = 0; step_seconds, resume_seconds = [], []; run = Counter()
     grad_norms = []   # per epoch, each optimizer step's global gradient norm before clipping
     resume_dir, resume_args = out_dir / "resume", {k: v for k, v in vars(a).items() if k not in RESUME_KNOBS}
@@ -603,6 +628,7 @@ def main():
         if position and (missed := snapshots.missed(step)):
             print(f"!!! snapshot(s) at step(s) {missed} are missing and cannot be written: this run continues from step {step}", flush=True)
     model.train(); t0, last, saved_at, stopped = time.time() - elapsed, time.time(), time.time(), False
+    step_terms = Counter()
     for ep in range(a.epochs):
         rng.shuffle(reqs)
         if ep < start_epoch: continue   # the finished epochs' shuffles are replayed, so the interrupted epoch's order returns
@@ -626,9 +652,12 @@ def main():
                 loss, terms = batch_loss(model, a, part, dev, anchors, anchor_sources, autocast)
                 (loss / group_records).backward()
                 run += terms
+                if on_step is not None: step_terms += terms
             run["n"] += variants; seen += round(variants); tokens_seen += sum(v.tokens for v in batch)
+            if on_step is not None: step_terms["n"] += variants
             peak_mem = max(peak_mem, allocated_bytes(dev))
             if ends_step:
+                if not a.full_ft and world > 1: sum_lora_gradients(model.trainable_parameters())
                 if not a.full_ft: norm = float(torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), MAX_GRAD_NORM, error_if_nonfinite=True))   # MasterAdamW clips by the global norm itself; both refuse a non-finite norm (a NaN gradient from a finite loss)
                 started = time.time(); opt.step(); sync(dev); optimizer_seconds += time.time() - started
                 grad_norms += [[] for _ in range(ep + 1 - len(grad_norms))]
@@ -639,6 +668,13 @@ def main():
                 if step % 10 == 0:
                     print(f"ep{ep} step {step}/{steps} loss {run['ce']/run['n']:.3f} kl {run['kl']/max(run['kl_n'],1):.3f} anchor {run['anchor']/max(run['anchor_n'],1):.3f} {(time.time()-t0)/seen:.3f}s/rec", flush=True)
                     run = Counter()
+                if on_step is not None:
+                    ce, count = full_ft.global_sum([step_terms["ce"], step_terms["n"]])
+                    on_step(model, tok, {"step": step, "steps": steps, "epoch": ep + (mb + 1) / len(plan),
+                                         "loss": ce / count, "lr": opt.param_groups[0]["lr"],
+                                         "grad_norm": grad_norms[ep][-1], "rank": rank, "world": world})
+                    step_terms.clear()
+                    last = time.time()
                 if step == steps: break
                 if snapshots and snapshots.due(step):
                     info = {"step": step, "steps": steps, "epoch": round(ep + (mb + 1) / len(plan), 6), "records_seen": round(full_ft.global_sum([seen])[0])}
@@ -660,7 +696,7 @@ def main():
 
     wall = time.time() - t0
     if a.full_ft: full_ft.save_backbone(model.lm, a.out)   # every rank: FSDP2 gathers to rank 0
-    else: model.lm.save_pretrained(a.out)
+    elif not rank: model.lm.save_pretrained(a.out)
     if rank: return
     backbone_seconds = time.time() - t0 - wall
     shutil.rmtree(resume_dir, ignore_errors=True)   # the checkpoint supersedes it

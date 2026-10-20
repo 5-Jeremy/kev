@@ -1,0 +1,41 @@
+init_from: jaredpalmer/kev-4b
+output: my_runs/local-finetune
+mode: full
+data:
+  path: data/kev-dry-run.jsonl
+  spec: null
+  state: []
+  labels: {}
+  mappings: {}
+  score_offset: 0
+  holdout: null
+  calibration_fraction: 0.15
+  development_fraction: 0.15
+train:
+  epochs: 20
+  seed: 0
+  lr: 1.0e-05
+  batch: 32
+  accum: 2
+  checkpointing: true
+  head_lr: 0.0
+  weight_decay: 0.01
+  max_state: null
+  max_steps: 0
+  length_sort: false
+  pass_tokens_max: 0
+  row_budget: 0
+  shared_prefix: null
+evaluation:
+  every_steps: 10
+  errors_every_eval: false
+  error_limit: 60
+  bootstrap_samples: 1000
+  bootstrap_seed: 0
+wandb:
+  enabled: true
+  project: kev-finetune
+  entity: jcarleton-texas-a-m-university
+  name: dry-run
+  mode: online
+  tags: []
