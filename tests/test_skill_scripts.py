@@ -207,6 +207,31 @@ def test_convert_label_matching():
     assert convert_data.get({"meta": {"team": "x"}}, "meta.team") == "x"
 
 
+@pytest.mark.parametrize("value", ["1.9", "-0.5", "0.99999999999999999", "NaN", "Infinity", "-Infinity", "1e9999999"])
+def test_convert_rejects_fractional_and_nonfinite_score_indices(value):
+    label, reason = convert_data.map_label(SPEC["questions"]["frustration"], value, {}, 0)
+    assert label is None and reason
+
+
+@pytest.mark.parametrize("value,offset,expected", [("1", 0, 1), ("1.0", 0, 1), ("2e0", 1, 1), ("-0.0", 0, 0), ("Annoyed", 0, 1)])
+def test_convert_preserves_integer_scores_offsets_and_level_text(value, offset, expected):
+    assert convert_data.map_label(SPEC["questions"]["frustration"], value, {}, offset) == (expected, None)
+
+
+def test_convert_skips_invalid_scores_and_continues(tmp_path, monkeypatch, capsys):
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({"questions": {"rating": SPEC["questions"]["frustration"]}}), encoding="utf-8")
+    src, out = tmp_path / "ratings.csv", tmp_path / "out.jsonl"
+    src.write_text("body,rating\nfirst,1.9\nsecond,Infinity\nthird,2.0\nfourth,medium\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["convert_data.py", str(spec), str(src), "--state", "body", "--score-offset", "1",
+                                    "--map", "rating=medium:2.0", "--out", str(out)])
+    assert convert_data.main() == 0
+    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert [r["state"] for r in rows] == ["third", "fourth"]
+    assert all(r["questions"]["rating"]["label"] == 1 for r in rows)
+    assert "2 rows skipped" in capsys.readouterr().out
+
+
 def test_extract_finds_typescript_and_python_questions(tmp_path):
     ts = ['import { experimental_evaluate as evaluate } from "ai";', 'const r = await evaluate({ model: "typesafe-ai/jev", state, questions: {',
           '  urgent: { type: "boolean", instructions: "Is this urgent?" },',
