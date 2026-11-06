@@ -117,7 +117,11 @@ def ones(*args, **kwargs):
 
 @pytest.fixture
 def startup(monkeypatch):
-    """Replace weight loading and the socket server, leaving serve.main, selection and option defaults intact."""
+    """Replace weight loading and the socket server, leaving serve.main, selection and option defaults intact.
+
+    Pin mlx_available off so these tests stay on the torch probe on Apple Silicon. An importable
+    mlx-lm makes _serving_device call Checkpoint.hybrid_base, and this stub has none. The MLX tests override the pin.
+    """
     loaded = []
     model = SimpleNamespace(hybrid=True, backend="torch", dtype="float32")
     class Checkpoint:
@@ -127,6 +131,7 @@ def startup(monkeypatch):
             loaded.append((dev, opts))
             return None, model
     monkeypatch.setattr(serve, "Checkpoint", Checkpoint)
+    monkeypatch.setattr(serve, "mlx_available", lambda: False)
     monkeypatch.setattr(serve, "Server", lambda ck, tok, model, dev: SimpleNamespace(truncate_states=False))
     monkeypatch.setattr(serve.app.state, "server", None, raising=False)
     import uvicorn
